@@ -220,7 +220,7 @@ impl Db {
     Ok(())
   }
 
-  pub fn query_hashes_with_paths(&self) -> AppResult<Vec<HashWithPaths>> {
+  pub fn query_hashes_with_paths(&self, duplicates_only: bool) -> AppResult<Vec<HashWithPaths>> {
     let conn = self.connection()?;
     let mut stmt = conn.prepare(
       r#"
@@ -257,7 +257,12 @@ impl Db {
       entry.occurrence_count += 1;
     }
 
-    Ok(grouped.into_values().collect())
+    let entries = grouped
+      .into_values()
+      .filter(|entry| !duplicates_only || entry.occurrence_count > 1)
+      .collect();
+
+    Ok(entries)
   }
 
   fn connection(&self) -> AppResult<Connection> {

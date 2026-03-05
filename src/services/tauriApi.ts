@@ -6,8 +6,8 @@ export const startScan = async (rootPath: string): Promise<void> => {
   await invoke("start_scan", { rootPath });
 };
 
-export const getHashesWithPaths = async (): Promise<HashWithPaths[]> => {
-  return invoke<HashWithPaths[]>("get_hashes_with_paths");
+export const getHashesWithPaths = async (duplicatesOnly = false): Promise<HashWithPaths[]> => {
+  return invoke<HashWithPaths[]>("get_hashes_with_paths", { duplicatesOnly });
 };
 
 export const getScanStatus = async (): Promise<ScanStatusDto> => {

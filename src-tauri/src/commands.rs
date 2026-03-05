@@ -99,10 +99,13 @@ pub async fn start_scan(
 }
 
 #[tauri::command]
-pub fn get_hashes_with_paths(state: State<'_, AppState>) -> Result<Vec<HashWithPaths>, String> {
+pub fn get_hashes_with_paths(
+  duplicates_only: Option<bool>,
+  state: State<'_, AppState>,
+) -> Result<Vec<HashWithPaths>, String> {
   state
     .db
-    .query_hashes_with_paths()
+    .query_hashes_with_paths(duplicates_only.unwrap_or(false))
     .map_err(|err| err.to_string())
 }
 
