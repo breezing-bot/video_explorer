@@ -52,7 +52,7 @@ pub async fn start_scan(
     let app_for_scan = app.clone();
     let path_for_scan = root_path.clone();
     let db_for_scan = db.clone();
-    let state_for_scan = Arc::clone(&scan_state);
+    let state_for_scan = scan_state.clone();
 
     let scan_result = tauri::async_runtime::spawn_blocking(move || {
       run_scan(app_for_scan, db_for_scan, state_for_scan, path_for_scan)
