@@ -1,13 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 
-import { HashWithPaths, ScanStatusDto } from "../types";
+import { BackupTreeNode, BackupTreeQuery, ScanRootOption, ScanStatusDto } from "../types";
 
 export const startScan = async (rootPath: string): Promise<void> => {
   await invoke("start_scan", { rootPath });
 };
 
-export const getHashesWithPaths = async (duplicatesOnly = false): Promise<HashWithPaths[]> => {
-  return invoke<HashWithPaths[]>("get_hashes_with_paths", { duplicatesOnly });
+export const listScanRoots = async (): Promise<ScanRootOption[]> => {
+  return invoke<ScanRootOption[]>("list_scan_roots");
+};
+
+export const getBackupTree = async (query: BackupTreeQuery): Promise<BackupTreeNode[]> => {
+  return invoke<BackupTreeNode[]>("get_backup_tree", { query });
 };
 
 export const getScanStatus = async (): Promise<ScanStatusDto> => {

@@ -8,7 +8,7 @@ mod scanner;
 use std::fs;
 use std::sync::{Arc, Mutex};
 
-use commands::{get_hashes_with_paths, get_scan_status, start_scan, AppState};
+use commands::{get_backup_tree, get_scan_status, list_scan_roots, start_scan, AppState};
 use db::Db;
 use models::InternalScanState;
 use tauri::Manager;
@@ -36,7 +36,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             start_scan,
-            get_hashes_with_paths,
+            list_scan_roots,
+            get_backup_tree,
             get_scan_status
         ])
         .run(tauri::generate_context!())

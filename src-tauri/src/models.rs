@@ -2,12 +2,34 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HashWithPaths {
-  pub full_hash: String,
-  pub fingerprint_hash: String,
-  pub file_size: u64,
-  pub paths: Vec<String>,
-  pub occurrence_count: usize,
+pub struct ScanRootOptionDto {
+  pub id: i64,
+  pub canonical_path: String,
+  pub status: String,
+  pub last_scanned_at: Option<String>,
+  pub total_videos: u64,
+  pub backed_up_videos: u64,
+  pub backup_ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupTreeNodeDto {
+  pub key: String,
+  pub name: String,
+  pub node_type: String,
+  pub full_path: String,
+  pub backup_count: u64,
+  pub video_count: u64,
+  pub backed_up_video_count: u64,
+  pub backup_ratio: f64,
+  pub children: Vec<BackupTreeNodeDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupTreeQueryDto {
+  pub root_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,4 +134,44 @@ impl InternalScanState {
 pub struct PathMetadata {
   pub mtime: i64,
   pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RootRecord {
+  pub id: i64,
+  pub canonical_path: String,
+  pub status: String,
+  pub last_scanned_at: Option<String>,
+  pub total_videos: u64,
+  pub backed_up_videos: u64,
+}
+
+impl RootRecord {
+  pub fn to_dto(&self) -> ScanRootOptionDto {
+    let backup_ratio = if self.total_videos == 0 {
+      0.0
+    } else {
+      self.backed_up_videos as f64 / self.total_videos as f64
+    };
+
+    ScanRootOptionDto {
+      id: self.id,
+      canonical_path: self.canonical_path.clone(),
+      status: self.status.clone(),
+      last_scanned_at: self.last_scanned_at.clone(),
+      total_videos: self.total_videos,
+      backed_up_videos: self.backed_up_videos,
+      backup_ratio,
+    }
+  }
+}
+
+#[derive(Debug, Clone)]
+pub struct TreeVideoRow {
+  pub root_id: i64,
+  pub root_path: String,
+  pub dir_path: String,
+  pub relative_path: String,
+  pub file_name: String,
+  pub backup_count: u64,
 }

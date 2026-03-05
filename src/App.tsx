@@ -2,12 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 
-import { getHashesWithPaths, getScanStatus, startScan } from "./services/tauriApi";
+import { getBackupTree, getScanStatus, listScanRoots, startScan } from "./services/tauriApi";
 import {
-  HashWithPaths,
+  BackupTreeNode,
   ScanCompletedEvent,
   ScanErrorEvent,
   ScanProgressEvent,
+  ScanRootOption,
   ScanStartedEvent,
   ScanStatusDto,
 } from "./types";
@@ -24,32 +25,117 @@ const DEFAULT_STATUS: ScanStatusDto = {
   finishedAt: null,
 };
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
+function ratioLabel(ratio: number): string {
+  return `${Math.round(ratio * 100)}%`;
+}
+
+function directoryColor(ratio: number): string {
+  if (ratio < 0.3) {
+    return "border-red-200 bg-red-50 text-red-700";
+  }
+  if (ratio < 0.8) {
+    return "border-amber-200 bg-amber-50 text-amber-700";
+  }
+  return "border-emerald-200 bg-emerald-50 text-emerald-700";
+}
+
+function videoColor(backupCount: number): string {
+  if (backupCount <= 1) {
+    return "border-red-200 bg-red-50 text-red-700";
+  }
+  return "border-emerald-200 bg-emerald-50 text-emerald-700";
+}
+
+function filterTree(nodes: BackupTreeNode[], keyword: string): BackupTreeNode[] {
+  const value = keyword.trim().toLowerCase();
+  if (!value) {
+    return nodes;
   }
 
-  const units = ["KB", "MB", "GB", "TB"];
-  let size = bytes / 1024;
-  let index = 0;
+  const walk = (node: BackupTreeNode): BackupTreeNode | null => {
+    const childHits = node.children
+      .map((child) => walk(child))
+      .filter((child): child is BackupTreeNode => child !== null);
 
-  while (size >= 1024 && index < units.length - 1) {
-    size /= 1024;
-    index += 1;
-  }
+    const selfHit =
+      node.name.toLowerCase().includes(value) || node.fullPath.toLowerCase().includes(value);
 
-  return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[index]}`;
+    if (selfHit || childHits.length > 0) {
+      return { ...node, children: childHits };
+    }
+
+    return null;
+  };
+
+  return nodes
+    .map((node) => walk(node))
+    .filter((node): node is BackupTreeNode => node !== null);
+}
+
+type TreeItemProps = {
+  node: BackupTreeNode;
+  depth: number;
+};
+
+function TreeItem({ node, depth }: TreeItemProps) {
+  const [expanded, setExpanded] = useState(depth < 2);
+  const hasChildren = node.children.length > 0;
+  const paddingLeft = 8 + depth * 16;
+
+  const badgeClass =
+    node.nodeType === "video" ? videoColor(node.backupCount) : directoryColor(node.backupRatio);
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 border-b border-slate-100 px-2 py-1.5" style={{ paddingLeft }}>
+        {node.nodeType === "directory" ? (
+          <button
+            type="button"
+            className="h-6 w-6 rounded border border-slate-200 text-xs text-slate-700"
+            onClick={() => setExpanded((value) => !value)}
+          >
+            {expanded ? "-" : "+"}
+          </button>
+        ) : (
+          <span className="inline-block h-6 w-6" />
+        )}
+
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-medium text-slate-900">{node.name}</div>
+          <div className="truncate font-mono text-[10px] text-slate-500">{node.fullPath}</div>
+        </div>
+
+        <span className={`rounded-full border px-2 py-0.5 text-xs font-semibold ${badgeClass}`}>
+          {node.nodeType === "video"
+            ? node.backupCount <= 1
+              ? "single"
+              : `x${node.backupCount}`
+            : `${ratioLabel(node.backupRatio)} (${node.backedUpVideoCount}/${node.videoCount})`}
+        </span>
+      </div>
+
+      {expanded && hasChildren && (
+        <div>
+          {node.children.map((child) => (
+            <TreeItem key={child.key} node={child} depth={depth + 1} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function App() {
   const [rootPath, setRootPath] = useState("");
   const [keyword, setKeyword] = useState("");
-  const [duplicatesOnly, setDuplicatesOnly] = useState(true);
-  const [hashRecords, setHashRecords] = useState<HashWithPaths[]>([]);
   const [status, setStatus] = useState<ScanStatusDto>(DEFAULT_STATUS);
   const [message, setMessage] = useState("Ready");
-  const [isLoadingList, setIsLoadingList] = useState(false);
-  const duplicatesOnlyRef = useRef(duplicatesOnly);
+  const [roots, setRoots] = useState<ScanRootOption[]>([]);
+  const [selectedRootIds, setSelectedRootIds] = useState<number[]>([]);
+  const [treeData, setTreeData] = useState<BackupTreeNode[]>([]);
+  const [isLoadingRoots, setIsLoadingRoots] = useState(false);
+  const [isLoadingTree, setIsLoadingTree] = useState(false);
+  const selectedRootIdsRef = useRef<number[]>(selectedRootIds);
 
   const progressPercent = useMemo(() => {
     if (status.totalCandidates === 0) {
@@ -58,34 +144,24 @@ function App() {
     return Math.round((status.scannedFiles / status.totalCandidates) * 100);
   }, [status.scannedFiles, status.totalCandidates]);
 
-  const filteredRecords = useMemo(() => {
-    const ordered = [...hashRecords].sort((left, right) => {
-      return right.occurrenceCount - left.occurrenceCount || left.fullHash.localeCompare(right.fullHash);
-    });
-
-    const value = keyword.trim().toLowerCase();
-    if (!value) {
-      return ordered;
-    }
-
-    return ordered.filter((entry) => {
-      const hitHash = entry.fullHash.toLowerCase().includes(value);
-      const hitPath = entry.paths.some((path) => path.toLowerCase().includes(value));
-      return hitHash || hitPath;
-    });
-  }, [hashRecords, keyword]);
+  const visibleTree = useMemo(() => filterTree(treeData, keyword), [treeData, keyword]);
 
   useEffect(() => {
-    duplicatesOnlyRef.current = duplicatesOnly;
-  }, [duplicatesOnly]);
+    selectedRootIdsRef.current = selectedRootIds;
+  }, [selectedRootIds]);
 
   useEffect(() => {
     void loadStatus();
+    void loadRoots();
   }, []);
 
   useEffect(() => {
-    void loadHashRecords(duplicatesOnly);
-  }, [duplicatesOnly]);
+    if (!selectedRootIds.length) {
+      setTreeData([]);
+      return;
+    }
+    void loadTree(selectedRootIds);
+  }, [selectedRootIds]);
 
   useEffect(() => {
     const unlisteners: Array<() => void> = [];
@@ -136,7 +212,12 @@ function App() {
           setMessage(
             `Scan finished. Scanned ${event.payload.scannedFiles}, hashed ${event.payload.hashedFiles}, removed ${event.payload.removedPaths}`,
           );
-          void loadHashRecords(duplicatesOnlyRef.current);
+
+          void loadRoots().then(() => {
+            if (selectedRootIdsRef.current.length) {
+              void loadTree(selectedRootIdsRef.current);
+            }
+          });
         }),
       );
 
@@ -187,17 +268,14 @@ function App() {
     }
   };
 
-  async function loadHashRecords(onlyDuplicates: boolean) {
-    setIsLoadingList(true);
-    try {
-      const data = await getHashesWithPaths(onlyDuplicates);
-      setHashRecords(data);
-    } catch (error) {
-      setMessage(`Query failed: ${String(error)}`);
-    } finally {
-      setIsLoadingList(false);
-    }
-  }
+  const toggleRoot = (rootId: number) => {
+    setSelectedRootIds((current) => {
+      if (current.includes(rootId)) {
+        return current.filter((value) => value !== rootId);
+      }
+      return [...current, rootId].sort((left, right) => left - right);
+    });
+  };
 
   async function loadStatus() {
     try {
@@ -211,13 +289,38 @@ function App() {
     }
   }
 
+  async function loadRoots() {
+    setIsLoadingRoots(true);
+    try {
+      const data = await listScanRoots();
+      setRoots(data);
+      setSelectedRootIds((current) => current.filter((item) => data.some((root) => root.id === item)));
+    } catch (error) {
+      setMessage(`Failed to load scan roots: ${String(error)}`);
+    } finally {
+      setIsLoadingRoots(false);
+    }
+  }
+
+  async function loadTree(rootIds: number[]) {
+    setIsLoadingTree(true);
+    try {
+      const data = await getBackupTree({ rootIds });
+      setTreeData(data);
+    } catch (error) {
+      setMessage(`Failed to load tree: ${String(error)}`);
+    } finally {
+      setIsLoadingTree(false);
+    }
+  }
+
   return (
     <main className="mx-auto grid max-w-7xl gap-4 pb-4 text-slate-900 md:gap-5 md:pb-6">
       <section className="rounded-2xl bg-gradient-to-r from-slate-950/90 via-slate-900/90 to-teal-900/85 px-5 py-4 text-white shadow-[0_14px_30px_rgba(8,24,48,0.32)] md:px-6 md:py-5">
-        <h1 className="text-2xl font-semibold tracking-tight md:text-3xl">Video Hash Explorer</h1>
+        <h1 className="text-2xl font-semibold tracking-tight md:text-3xl">Video Backup Explorer</h1>
         <p className="mt-1.5 text-sm text-slate-200 md:text-base">
-          Scan folders, compute content hashes, and keep the hash-to-path mapping synchronized in
-          SQLite.
+          Build index by scanning folders, then select multiple historical roots to inspect backup
+          coverage as a colored directory tree.
         </p>
       </section>
 
@@ -257,6 +360,7 @@ function App() {
             style={{ width: `${progressPercent}%` }}
           />
         </div>
+
         <div className="mt-3 grid grid-cols-2 gap-2.5 md:grid-cols-4">
           <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
             <span className="block text-[11px] uppercase tracking-[0.08em] text-slate-500">Total</span>
@@ -275,90 +379,78 @@ function App() {
             <strong className="mt-0.5 block text-xl font-semibold leading-none">{status.errorCount}</strong>
           </div>
         </div>
+
         <p className="mt-3 text-sm text-slate-600">{message}</p>
       </section>
 
       <section className="panel p-4 md:p-5">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-lg font-semibold text-slate-900">Hash Map</h2>
-          <div className="flex items-center gap-2">
-            <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700">
+          <h2 className="text-lg font-semibold text-slate-900">Historical Scan Roots</h2>
+          <button type="button" className="btn-soft" onClick={() => void loadRoots()} disabled={isLoadingRoots}>
+            {isLoadingRoots ? "Loading..." : "Refresh Roots"}
+          </button>
+        </div>
+
+        <div className="grid gap-2 md:grid-cols-2">
+          {roots.map((root) => (
+            <label
+              key={root.id}
+              className="flex cursor-pointer items-start gap-3 rounded-lg border border-slate-200 bg-white px-3 py-2"
+            >
               <input
                 type="checkbox"
-                className="h-4 w-4 rounded border-slate-300 accent-teal-600"
-                checked={duplicatesOnly}
-                onChange={(event) => setDuplicatesOnly(event.currentTarget.checked)}
+                className="mt-1 h-4 w-4 rounded border-slate-300 accent-teal-600"
+                checked={selectedRootIds.includes(root.id)}
+                onChange={() => toggleRoot(root.id)}
               />
-              Only hashes with multiple paths
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-semibold text-slate-900">{root.canonicalPath}</p>
+                <p className="text-xs text-slate-600">
+                  {root.status} · {root.backedUpVideos}/{root.totalVideos} · {ratioLabel(root.backupRatio)}
+                </p>
+              </div>
             </label>
+          ))}
+        </div>
+
+        {!roots.length && <p className="text-sm text-slate-500">No historical roots yet. Run scan first.</p>}
+      </section>
+
+      <section className="panel p-4 md:p-5">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-lg font-semibold text-slate-900">Backup Tree</h2>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              className="input-base min-w-[240px]"
+              placeholder="Filter by directory or video path"
+              value={keyword}
+              onChange={(event) => setKeyword(event.currentTarget.value)}
+            />
             <button
               type="button"
               className="btn-soft"
-              onClick={() => void loadHashRecords(duplicatesOnly)}
-              disabled={isLoadingList}
+              onClick={() => void loadTree(selectedRootIds)}
+              disabled={!selectedRootIds.length || isLoadingTree}
             >
-              {isLoadingList ? "Loading..." : "Refresh"}
+              {isLoadingTree ? "Loading..." : "Refresh Tree"}
             </button>
           </div>
         </div>
 
-        <input
-          type="text"
-          className="input-base"
-          placeholder="Filter by hash or path"
-          value={keyword}
-          onChange={(event) => setKeyword(event.currentTarget.value)}
-        />
-
-        <div className="mt-2 text-xs text-slate-600">
-          Showing {filteredRecords.length} of {hashRecords.length} hash groups
+        <div className="mb-2 text-xs text-slate-600">
+          Selected roots: {selectedRootIds.length} · Displayed roots: {visibleTree.length}
         </div>
 
-        <div className="mt-2 max-h-[520px] overflow-auto rounded-xl border border-slate-200 bg-white">
-          <table className="min-w-full border-collapse text-left text-xs text-slate-800">
-            <thead className="sticky top-0 z-10 bg-slate-100 text-[11px] uppercase tracking-[0.08em] text-slate-600">
-              <tr>
-                <th className="w-[32%] px-3 py-2 font-semibold">Hash</th>
-                <th className="w-[10%] px-3 py-2 font-semibold">Count</th>
-                <th className="w-[12%] px-3 py-2 font-semibold">Size</th>
-                <th className="w-[46%] px-3 py-2 font-semibold">Paths</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredRecords.map((record) => (
-                <tr key={record.fullHash} className="border-t border-slate-100 align-top hover:bg-slate-50/70">
-                  <td className="px-3 py-2 font-mono text-[11px] leading-5 text-slate-800">
-                    <div className="break-all">{record.fullHash}</div>
-                    <div className="mt-1 break-all text-[10px] text-slate-500">
-                      fp: {record.fingerprintHash}
-                    </div>
-                  </td>
-                  <td className="px-3 py-2 text-sm font-semibold text-slate-900">{record.occurrenceCount}</td>
-                  <td className="px-3 py-2 text-sm text-slate-700">{formatBytes(record.fileSize)}</td>
-                  <td className="px-3 py-2 text-[11px] text-slate-700">
-                    <div className="break-all font-mono text-[10px] text-slate-500">{record.paths[0]}</div>
-                    <details className="mt-1">
-                      <summary className="cursor-pointer select-none text-[11px] font-semibold text-teal-700">
-                        {record.paths.length > 1
-                          ? `Show all ${record.paths.length} paths`
-                          : "Show path details"}
-                      </summary>
-                      <ul className="mt-1 space-y-1">
-                        {record.paths.map((path) => (
-                          <li key={`${record.fullHash}-${path}`} className="break-all font-mono text-[10px] text-slate-700">
-                            {path}
-                          </li>
-                        ))}
-                      </ul>
-                    </details>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="max-h-[620px] overflow-auto rounded-xl border border-slate-200 bg-white">
+          {visibleTree.map((root) => (
+            <TreeItem key={root.key} node={root} depth={0} />
+          ))}
 
-          {!filteredRecords.length && (
-            <p className="px-3 py-4 text-sm text-slate-500">No hash record found for current filters.</p>
+          {!visibleTree.length && (
+            <p className="px-3 py-4 text-sm text-slate-500">
+              {selectedRootIds.length ? "No matching nodes for current filter." : "Select historical roots to render tree."}
+            </p>
           )}
         </div>
       </section>

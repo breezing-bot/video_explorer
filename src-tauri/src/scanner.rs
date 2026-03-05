@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -23,9 +22,10 @@ pub fn run_scan(
   root_path: String,
 ) -> AppResult<()> {
   let canonical_root = normalize_root_path(&root_path)?;
-  let scan_id = db.start_scan(&canonical_root)?;
-  let mut walk_errors = 0_u64;
+  let root_id = db.upsert_scan_root(&canonical_root)?;
+  db.mark_root_locations_missing(root_id)?;
 
+  let mut walk_errors = 0_u64;
   let mut candidates: Vec<PathBuf> = Vec::new();
   for entry in WalkDir::new(&canonical_root).into_iter() {
     match entry {
@@ -37,7 +37,7 @@ pub fn run_scan(
       Err(err) => {
         walk_errors += 1;
         let event = ScanErrorEvent {
-          scan_id,
+          scan_id: root_id,
           path: None,
           message: err.to_string(),
         };
@@ -53,21 +53,20 @@ pub fn run_scan(
 
   let started_event = ScanStartedEvent {
     root_path: canonical_root.clone(),
-    scan_id,
+    scan_id: root_id,
     total_candidates: candidates.len() as u64,
   };
   let _ = app.emit("scan:started", started_event);
 
-  let mut seen_paths = HashSet::new();
   let mut hashed_files = 0_u64;
   let mut scanned_files = 0_u64;
   let mut error_count = walk_errors;
 
   for file_path in &candidates {
     let normalized_path = file_path.to_string_lossy().to_string();
-    seen_paths.insert(normalized_path.clone());
+    let relative_path = to_relative_path(&canonical_root, file_path);
 
-    match process_video_file(&db, scan_id, file_path, &normalized_path) {
+    match process_video_file(&db, root_id, file_path, &relative_path) {
       Ok(was_hashed) => {
         if was_hashed {
           hashed_files += 1;
@@ -76,7 +75,7 @@ pub fn run_scan(
       Err(err) => {
         error_count += 1;
         let event = ScanErrorEvent {
-          scan_id,
+          scan_id: root_id,
           path: Some(normalized_path.clone()),
           message: err.to_string(),
         };
@@ -95,7 +94,7 @@ pub fn run_scan(
     }
 
     let progress_event = ScanProgressEvent {
-      scan_id,
+      scan_id: root_id,
       path: normalized_path,
       scanned_files,
       total_candidates: candidates.len() as u64,
@@ -105,16 +104,16 @@ pub fn run_scan(
     let _ = app.emit("scan:progress", progress_event);
   }
 
-  let mut removed_paths = 0_u64;
-  for existing in db.list_paths_under_root(&canonical_root)? {
-    if !seen_paths.contains(&existing) {
-      db.delete_path(&existing)?;
-      removed_paths += 1;
-    }
-  }
+  let removed_paths = db.delete_missing_locations(root_id)?;
+  db.cleanup_orphan_files()?;
+  db.recompute_backup_counts()?;
+  db.recompute_root_stats(root_id)?;
 
-  db.cleanup_orphan_contents()?;
-  db.finish_scan(scan_id, "completed", scanned_files, hashed_files, error_count)?;
+  if error_count == 0 {
+    db.set_root_status(root_id, "ready")?;
+  } else {
+    db.set_root_status(root_id, "ready_with_errors")?;
+  }
 
   let finished_at = now_iso8601();
   {
@@ -127,7 +126,7 @@ pub fn run_scan(
   }
 
   let completed_event = ScanCompletedEvent {
-    scan_id,
+    scan_id: root_id,
     root_path: canonical_root,
     scanned_files,
     hashed_files,
@@ -140,7 +139,7 @@ pub fn run_scan(
   Ok(())
 }
 
-fn process_video_file(db: &Db, scan_id: i64, path: &Path, path_string: &str) -> AppResult<bool> {
+fn process_video_file(db: &Db, root_id: i64, path: &Path, relative_path: &str) -> AppResult<bool> {
   let metadata = fs::metadata(path)?;
   let file_size = metadata.len();
   let mtime = metadata
@@ -150,18 +149,27 @@ fn process_video_file(db: &Db, scan_id: i64, path: &Path, path_string: &str) -> 
     .map(|duration| duration.as_secs() as i64)
     .unwrap_or(0);
 
-  if let Some(existing) = db.get_path_metadata(path_string)? {
+  if let Some(existing) = db.get_path_metadata(root_id, relative_path)? {
     if existing.size == file_size && existing.mtime == mtime {
-      db.touch_path(path_string, scan_id)?;
+      db.touch_path(root_id, relative_path)?;
       return Ok(false);
     }
   }
 
   let fingerprint_hash = fingerprint_file(path, file_size)?;
   let full_hash = full_hash_file(path)?;
+  let file_name = path
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or_default()
+    .to_string();
+  let dir_path = extract_parent(relative_path);
+
   db.upsert_hashed_path(
-    path_string,
-    scan_id,
+    root_id,
+    relative_path,
+    &dir_path,
+    &file_name,
     mtime,
     file_size,
     &fingerprint_hash,
@@ -173,7 +181,24 @@ fn process_video_file(db: &Db, scan_id: i64, path: &Path, path_string: &str) -> 
 
 fn normalize_root_path(root: &str) -> AppResult<String> {
   let canonical = fs::canonicalize(root)?;
-  Ok(canonical.to_string_lossy().to_string())
+  Ok(canonical.to_string_lossy().replace('\\', "/"))
+}
+
+fn to_relative_path(root: &str, path: &Path) -> String {
+  let path_text = path.to_string_lossy().replace('\\', "/");
+  if let Some(trimmed) = path_text.strip_prefix(root) {
+    trimmed.trim_start_matches('/').to_string()
+  } else {
+    path_text
+  }
+}
+
+fn extract_parent(relative_path: &str) -> String {
+  if let Some((parent, _)) = relative_path.rsplit_once('/') {
+    parent.to_string()
+  } else {
+    String::new()
+  }
 }
 
 fn is_video_file(path: &Path) -> bool {

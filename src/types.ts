@@ -1,9 +1,27 @@
-export interface HashWithPaths {
-  fullHash: string;
-  fingerprintHash: string;
-  fileSize: number;
-  paths: string[];
-  occurrenceCount: number;
+export interface ScanRootOption {
+  id: number;
+  canonicalPath: string;
+  status: string;
+  lastScannedAt: string | null;
+  totalVideos: number;
+  backedUpVideos: number;
+  backupRatio: number;
+}
+
+export interface BackupTreeNode {
+  key: string;
+  name: string;
+  nodeType: "directory" | "video";
+  fullPath: string;
+  backupCount: number;
+  videoCount: number;
+  backedUpVideoCount: number;
+  backupRatio: number;
+  children: BackupTreeNode[];
+}
+
+export interface BackupTreeQuery {
+  rootIds: number[];
 }
 
 export interface ScanStatusDto {
