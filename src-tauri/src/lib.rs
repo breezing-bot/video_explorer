@@ -1,14 +1,44 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+mod commands;
+mod db;
+mod error;
+mod hashing;
+mod models;
+mod scanner;
+
+use std::fs;
+use std::sync::{Arc, Mutex};
+
+use commands::{get_hashes_with_paths, get_scan_status, start_scan, AppState};
+use db::Db;
+use models::InternalScanState;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|err| format!("failed to resolve app data directory: {err}"))?;
+            fs::create_dir_all(&app_data_dir)?;
+
+            let db = Db::new(app_data_dir.join("video_index.db"));
+            db.init_schema()?;
+
+            app.manage(AppState {
+                db,
+                scan_state: Arc::new(Mutex::new(InternalScanState::default())),
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            start_scan,
+            get_hashes_with_paths,
+            get_scan_status
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
